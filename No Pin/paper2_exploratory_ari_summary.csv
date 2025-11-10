@@ -1,0 +1,2 @@
+Mode,Models,TopK,Words_used,Seed,Best_ARI,W2V_Cluster_Sig,BERT_Cluster_Sig
+FULL,BERT,5000,28,42,1.0,1fc770476f,ff7324a889
