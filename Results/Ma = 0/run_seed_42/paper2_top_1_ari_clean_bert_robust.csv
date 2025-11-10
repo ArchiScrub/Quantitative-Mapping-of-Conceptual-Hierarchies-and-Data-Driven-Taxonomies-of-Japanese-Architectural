@@ -1,0 +1,2 @@
+Rank,ARI_obs,Boot_mean,Boot_std,CI_low,CI_high,P_value,Group0,Group1
+Confirmatory,0.852099817407182,0.8534494042396545,0.14020630717277527,0.5144033074378976,1.0,0.0001999600079984003,"aware, ma, mu, sabi, shakkei, wabi, wabi_sabi","byōbu, chashitsu, chigaidana, doma, en, engawa, fusuma, genkan, haiden, hisashi, honden, ikezuishi, karesansui, roji, sandō, shimenawa, shōji, tokonoma, tomeishi, torii, tsuboniwa"
