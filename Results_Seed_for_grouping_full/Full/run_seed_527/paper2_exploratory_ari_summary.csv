@@ -1,0 +1,3 @@
+Mode,Models,TopK,Words_used,Seed,Best_ARI,W2V_Cluster_Sig,BERT_Cluster_Sig
+FULL,BERT,0,28,527,,ec7dc82e69,61944fd86d
+CLEAN,BERT,0,28,527,,fe08f76965,61944fd86d

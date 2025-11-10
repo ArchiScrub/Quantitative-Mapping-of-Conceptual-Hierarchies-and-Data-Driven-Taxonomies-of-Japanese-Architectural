@@ -1,0 +1,21 @@
+Lowest-margin terms (most ambiguous first)
+ikezuishi	0.0083
+shakkei	0.0263
+engawa	0.0290
+tomeishi	0.0459
+en	0.0463
+karesansui	0.0490
+shimenawa	0.0558
+roji	0.0739
+mu	0.0740
+byōbu	0.0794
+tsuboniwa	0.0931
+chashitsu	0.0937
+sandō	0.0953
+doma	0.0984
+fusuma	0.0992
+torii	0.0999
+wabi	0.1053
+haiden	0.1054
+tokonoma	0.1061
+chigaidana	0.1068
