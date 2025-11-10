@@ -1,0 +1,2224 @@
+"""
+Paper 2 pipeline (rewritten): cached-model exploratory analyses with parity checks, guards, and ARI runtime controls.
+
+Key fixes for Paper-1 parity:
+- Embeddings: average *non-special token* vectors (not [CLS]) across regex-matched contexts, as in Paper-1.
+- Contexts: strict word-boundary regex (no substring noise).
+- Cache hygiene: fail-fast if FULL and CLEAN BERT caches are byte-identical.
+- Correct BERT-cache hashing: directories are hashed with a directory hasher; files with a file hasher.
+- PEFT inference: call the PEFT-wrapped model directly (don’t fall back to the base model).
+
+Default behaviour:
+- No training. If caches are missing and degrade_on_missing_caches=False, fail-fast; if True, degrade to base BERT or skip missing W2V.
+- ARI runtime scope defaults to BERT-only, CLEAN corpus, seed 42, top 5000 groupings, with deterministic sampling to scale beyond exhaustive.
+"""
+
+from __future__ import annotations  # must be first (after comments/docstring)
+
+# --- Environment setup for full reproducibility (set BEFORE importing numpy/torch/sklearn) ---
+import os
+os.environ["PYTHONHASHSEED"] = "42"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+import io
+import re
+SENT_SPLIT_RE_P1 = re.compile(r"[.\n]+")
+import sys
+import json
+import math
+import time
+import random
+import yaml
+import hashlib
+import logging
+import argparse
+# PyTorch next, then lock determinism and CPU thread cap (does NOT disable GPU)
+import torch
+torch.use_deterministic_algorithms(True)           # enforce deterministic kernels
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.set_num_threads(1)                           # cap CPU threads; GPU still used normally
+
+print(f"[CUDA Check] Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[CUDA Check] Device Count: {torch.cuda.device_count()}")
+    print(f"[CUDA Check] Current Device: {torch.cuda.current_device()}")
+    print(f"[CUDA Check] Device Name: {torch.cuda.get_device_name(0)}") # Assumes device 0
+
+print("[det] cudnn.benchmark:", torch.backends.cudnn.benchmark,
+      "deterministic:", torch.backends.cudnn.deterministic,
+      "tf32(matmul,cudnn):", torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
+      "cpu_threads:", torch.get_num_threads())
+
+import textwrap
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Union, cast
+from peft import PeftModel
+
+import matplotlib
+matplotlib.use("Agg") # Must be before pyplot
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines # Keep if used globally
+
+plt.rcParams.update({"figure.dpi": 300, "font.family": "DejaVu Sans"})
+
+import seaborn as sns
+import sklearn
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import adjusted_rand_score as _ari
+
+import networkx as nx
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import pdist
+
+# IMPORTANT: use the Fast tokenizer to get offset mappings for subword alignment
+from transformers import BertTokenizerFast as BertTokenizer, BertForMaskedLM, __version__ as _transformers_ver
+from gensim.models import Word2Vec
+
+# tqdm fallback
+try:
+    from tqdm import tqdm  # type: ignore
+except ImportError:  # pragma: no cover
+    def tqdm(x, **_):  # type: ignore
+        """Fallback progress-bar shim used when `tqdm` is unavailable."""
+        return x
+
+def _pbar(it, **kw):
+    """Convenience wrapper to honour use_tqdm flag."""
+    return tqdm(it, disable=not globals().get("use_tqdm", True), **kw)
+
+
+# =========================
+# Logging
+# =========================
+logger = logging.getLogger("paper2")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(_handler)
+
+
+# =========================
+# Small utilities
+# =========================
+def ensure_dir(p: Path) -> None:
+    """Create directory p (and parents) if it does not exist."""
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def banner(msg: str) -> None:
+    """Print a visual banner line around a message for readable logs."""
+    logger.info("=" * 72)
+    logger.info(msg)
+    logger.info("=" * 72)
+
+
+def _norm_set_upper(values) -> set:
+    """
+    Normalize a config field to an UPPERCASE set of strings.
+    Accepts a string, list/tuple/set, or None. Whitespace is stripped.
+    """
+    if values is None:
+        return set()
+    if isinstance(values, (list, tuple, set)):
+        return {str(v).strip().upper() for v in values}
+    return {str(values).strip().upper()}
+
+
+def l2_normalise(v: np.ndarray) -> np.ndarray:
+    """Row-wise L2 normalise an array with zero-safe handling."""
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    n[n == 0] = 1.0
+    return v / n
+
+
+def read_yaml(path: Path) -> dict:
+    """Read a YAML file from path using UTF-8 and return a dict."""
+    with io.open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def set_all_seeds(seed_value: int) -> None:
+    """Deterministically seed Python, NumPy, and Torch."""
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+
+
+def write_env_report(out_dir: Path, dev: torch.device, run_seed: int) -> None:
+    """Write environment and device info for reproducibility parity with Paper 1."""
+    report = {
+        "python": sys.version,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "torch": torch.__version__,
+        "sklearn": sklearn.__version__,
+        "transformers": _transformers_ver,
+        "matplotlib": matplotlib.__version__,
+        "networkx": nx.__version__,
+        "device": str(dev),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "seed": int(run_seed),
+    }
+    ensure_dir(out_dir)
+    with io.open(out_dir / "paper2_env.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+# This is the FILE hashing function, correctly named.
+def sha256_file_p1(path: Path) -> str:
+    """Computes the SHA256 hash of a file for integrity checking (Paper 1 logic)."""
+    h = hashlib.sha256()
+    # Check if the path exists and is a file before opening
+    if not path.is_file():
+        logger.warning(f"Attempted to hash non-existent or non-file path: {path}")
+        return ""  # Return an empty string or handle as appropriate
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (OSError, IOError) as e:
+        logger.error(f"Error reading file for hashing '{path}': {e}")
+        return ""  # Return an empty string on error
+
+# This is the DIRECTORY hashing function, now correctly named _sha256_dir.
+# It internally calls the file hashing function sha256_file_p1.
+def _sha256_dir(p: Path) -> str:
+    """Deterministic SHA-256 across *all* files in a directory tree (sorted)."""
+    h = hashlib.sha256()
+    if not p.is_dir():
+        return ""
+    for fp in sorted(p.rglob("*")):
+        if fp.is_file():
+            try:
+                # Correctly calls the FILE hashing function
+                file_hash = sha256_file_p1(fp)
+                if file_hash:  # Only update if the file hash was successful
+                    h.update(file_hash.encode())
+            except (OSError, IOError) as e:
+                # File might disappear or be unreadable during traversal; skip it.
+                logger.debug(f"Skipping unreadable file while hashing directory '{fp}': {e}")
+    return h.hexdigest()
+
+def _hash_for_checkpoint(p: Path) -> str:
+    """Hash a checkpoint: if it's a directory use _sha256_dir, otherwise use sha256_file_p1."""
+    if p.is_dir():
+        return _sha256_dir(p)
+    return sha256_file_p1(p)
+
+def _dump_clusters(tag: str, clusters: Dict[str, int]) -> None:
+    """Write {term, cluster} to results/paper2_clusters_{tag}.csv."""
+    if not clusters:
+        return
+    ensure_dir(res_dir)
+    pd.DataFrame(
+        [{"term": w, "cluster": int(c)} for w, c in sorted(clusters.items())]
+    ).to_csv(res_dir / f"paper2_clusters_{tag}.csv", index=False)
+
+
+def validate_config(conf: dict) -> None:
+    """
+    Validate required config pieces and document effective defaults,
+    fail-fast on impossibilities that would waste long runs.
+    """
+    words = list(conf.get("paper2_exploratory", {}).get("words_to_explore",
+                 conf.get("target_words", [])))
+    if not words:
+        raise ValueError(
+            "No target words found. Provide paper2_exploratory.words_to_explore "
+            "or target_words in config.yaml"
+        )
+
+    ari_scope_local = conf.get("ari_runtime", {})
+    ari_models_local  = _norm_set_upper(ari_scope_local.get("models", ["BERT"]))
+    ari_corpora_local = _norm_set_upper(ari_scope_local.get("corpora", ["FULL", "CLEAN"]))
+
+    if not ari_models_local.issubset({"BERT", "W2V"}):
+        raise ValueError(
+            f"ari_runtime.models must be subset of {{'BERT','W2V'}}, "
+            f"got {ari_models_local}"
+        )
+    if not ari_corpora_local.issubset({"FULL", "CLEAN"}):
+        raise ValueError(
+            f"ari_runtime.corpora must be subset of {{'FULL','CLEAN'}}, "
+            f"got {ari_corpora_local}"
+        )
+
+    boot = ari_scope_local.get("bootstrap", {"enabled": True, "B": 2000, "ci": 0.95})
+    perm = ari_scope_local.get("permutation", {"enabled": True, "R": 5000})
+    if boot.get("enabled", True) and int(boot.get("B", 2000)) <= 0:
+        raise ValueError("bootstrap.B must be positive when bootstrap.enabled is true")
+    if perm.get("enabled", True) and int(perm.get("R", 5000)) <= 0:
+        raise ValueError("permutation.R must be positive when permutation.enabled is true")
+
+
+# =========================
+# Config & deterministic setup
+# =========================
+cfg_path = Path("config.yaml")
+cfg = read_yaml(cfg_path)
+validate_config(cfg)
+
+# CLI: non-invasive operational controls
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--mode", choices=["all", "ari", "visuals"], default="all")
+parser.add_argument("--verbose", action="store_true")
+parser.add_argument("--log-file", type=str, default="")
+args, _ = parser.parse_known_args()
+
+if args.verbose:
+    logger.setLevel(logging.DEBUG)
+if args.log_file:
+    file_handler = logging.FileHandler(args.log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(file_handler)
+
+seed = int(cfg.get("seed", 42))
+set_all_seeds(seed)
+
+fig_dir = Path("figures"); ensure_dir(fig_dir)
+res_dir = Path("results"); ensure_dir(res_dir)
+models_dir = Path("models"); ensure_dir(models_dir)
+
+# Shared settings
+analysis_cfg = cfg.get("analysis_params", {})
+k_clusters = int(analysis_cfg.get("model_clusters", 2))
+kmeans_n_init = int(analysis_cfg.get("kmeans_n_init", 50))
+kmeans_max_iter = int(analysis_cfg.get("kmeans_max_iter", 1000))
+use_zscore = bool(analysis_cfg.get("z_score_for_clustering", True))
+
+paper2_cfg = cfg.get("paper2_analysis", {})
+sim_threshold = float(paper2_cfg.get("similarity_threshold", 0.25))
+hilite = set(paper2_cfg.get("highlight_central", []))
+
+web_topk = int(paper2_cfg.get("web_topk_per_node", 3))
+web_q = float(paper2_cfg.get("web_global_quantile", 0.85))
+web_use_mst = bool(paper2_cfg.get("web_use_mst", True))
+web_label_fs = int(paper2_cfg.get("web_label_fontsize", 9))
+
+ari2_cfg = cfg.get("paper2_settings", {}).get("ari", {})
+plot_top_n = int(ari2_cfg.get("plot_top_n", 10))   # how many top ARI groupings to plot
+ari_min_accept = float(ari2_cfg.get("min_ari_threshold", 0.0))
+ari_max_exhaustive = int(ari2_cfg.get("max_words_for_exhaustive", 15))
+
+tsne_cfg = cfg.get("tsne_params", {})
+tsne_pca_dims = int(tsne_cfg.get("pca_init_dims", 20))
+tsne_perp_div = max(1, int(tsne_cfg.get("perplexity_divisor", 2)))
+
+# Optional runtime flags
+use_gpu = bool(cfg.get("use_gpu", False))
+device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+write_env_report(res_dir, device, seed)
+
+use_tqdm = bool(cfg.get("use_tqdm", True))
+# Fail-fast by default. Degrade only when explicitly allowed, except adapter path (see below).
+degrade_on_missing = bool(cfg.get("degrade_on_missing_caches", False))
+
+# ARI runtime scope, independent from general visuals
+ari_scope  = cfg.get("ari_runtime", {})
+ari_models = _norm_set_upper(ari_scope.get("models", ["BERT"]))
+ari_corpora = _norm_set_upper(ari_scope.get("corpora", ["FULL", "CLEAN"]))
+ari_seed = int(ari_scope.get("seed", 42))
+top_k = int(ari_scope.get("top_k", 5000))
+max_samples = int(ari_scope.get("max_samples", 5000))
+boot_cfg = ari_scope.get("bootstrap", {"enabled": True, "B": 2000, "ci": 0.95})
+perm_cfg = ari_scope.get("permutation", {"enabled": True, "R": 5000})
+top_exemplar_groupings = int(ari_scope.get("top_exemplars_groupings", 1))
+exemplars_per_term = int(cfg.get("paper2_exploratory", {}).get("exemplars_per_term", 3))
+boot_cap = int(cfg.get("bootstrap_max", 2000))
+perm_cap = int(cfg.get("permutation_max", 5000))
+aggregate_seeds = bool(cfg.get("aggregate_seeds", False))
+
+# =========================
+# Paths from config
+# =========================
+corpus_dir = Path(cfg.get("corpus_dir", "txt_corpus"))
+corpus_file_bert_full = corpus_dir / cfg.get("corpus_file_bert_cased", "BERT_Corpus.txt")
+corpus_file_bert_clean = corpus_dir / cfg.get("corpus_file_bert_cased_cl", "BERT_Corpus_CL.txt")
+
+# Word list for Paper 2 exploratory
+words_to_explore = list(cfg.get("paper2_exploratory", {}).get("words_to_explore", cfg.get("target_words", [])))
+
+
+# =========================
+# Guardrails: versions, cache integrity, self-test (all opt-in)
+# =========================
+def enforce_versions_if_requested() -> None:
+    """Abort if runtime versions do not match requirements in config (opt-in)."""
+    if not bool(cfg.get("enforce_versions", False)):
+        return
+    req = cfg.get("require_versions", {})
+
+    def _chk(name: str, got: str, want: Optional[str]) -> None:
+        if want and str(got) != str(want):
+            raise RuntimeError(f"Version mismatch {name}: got {got}, expected {want}")
+
+    _chk("python", sys.version.split()[0], req.get("python"))
+    _chk("numpy", np.__version__, req.get("numpy"))
+    _chk("pandas", pd.__version__, req.get("pandas"))
+    _chk("torch", torch.__version__, req.get("torch"))
+    _chk("sklearn", sklearn.__version__, req.get("sklearn"))
+    _chk("transformers", _transformers_ver, req.get("transformers"))
+
+
+def verify_caches_if_requested(mode: str) -> None:
+    """Verify cache artefacts against config-provided hashes (opt-in)."""
+    if not bool(cfg.get("verify_caches", False)):
+        return
+    spec = cfg.get("cache_hashes", {}).get(mode, {})
+    for rel, expected in spec.items():
+        path = Path(rel)
+        if not path.is_absolute():
+            path = Path(".") / path
+        if not path.exists():
+            raise FileNotFoundError(f"[{mode}] missing artefact: {rel}")
+        got = sha256_file_p1(path)
+        if expected and got != expected:
+            raise RuntimeError(f"[{mode}] hash mismatch for {rel}: {got} != {expected}")
+
+
+def self_test_if_requested() -> None:
+    """Quick smoke test: ensure models load and one BERT pass runs (opt-in)."""
+    if not bool(cfg.get("self_test", False)):
+        return
+    for mode, corpus in (("FULL", corpus_file_bert_full), ("CLEAN", corpus_file_bert_clean)):
+        cbow, sg = load_w2v_cached(mode)
+        tok, bert_ft, _ = load_bert_finetuned_cached(mode, allow_degrade=degrade_on_missing)
+        if cbow is None and sg is None and bert_ft is None:
+            raise RuntimeError(f"[self_test] No cached models under models/{mode}/")
+        if bert_ft is not None and corpus.exists():
+            _ = get_contextual_bert_vectors("test", bert_ft, tok, corpus, max_sentences=1)
+
+
+def _model_cache_dir(mode: str) -> Path:
+    return models_dir / mode / "bert_cased"
+
+
+def check_model_caches_distinctness() -> None:
+    """
+    Fail fast if models/FULL/bert_cased and models/CLEAN/bert_cased are byte-identical.
+    This catches the 'copied model' situation that forces identical ARIs.
+    """
+    full_dir = _model_cache_dir("FULL")
+    clean_dir = _model_cache_dir("CLEAN")
+
+    # Prefer HF-style dir hash if both exist; else compare legacy pt files if present
+    full_hash = _sha256_dir(full_dir) if full_dir.exists() else ""
+    clean_hash = _sha256_dir(clean_dir) if clean_dir.exists() else ""
+
+    if not full_hash and not clean_hash:
+        # try legacy .pt
+        full_pt = models_dir / "FULL" / "bert_final.pt"
+        clean_pt = models_dir / "CLEAN" / "bert_final.pt"
+        if full_pt.exists() and clean_pt.exists():
+            full_hash = sha256_file_p1(full_pt)
+            clean_hash = sha256_file_p1(clean_pt)
+
+    if full_hash and clean_hash and full_hash == clean_hash:
+        raise RuntimeError(
+            "Detected identical BERT caches for FULL and CLEAN.\n"
+            "Action: delete models/CLEAN/bert_cased/ (and/or CLEAN/bert_final.pt) "
+            "and re-run Paper 1 to rebuild CLEAN. Then re-run this script."
+        )
+
+
+# =========================
+# Model loaders (cache-only) with Paper-1 cache compatibility and graceful degrade
+# =========================
+def _hf_from_pretrained_base(revision: Optional[str] = None) -> Tuple[BertTokenizer, BertForMaskedLM]:
+    """Helper to honour optional hf_revision pin from config."""
+    kwargs = {"revision": revision} if revision else {}
+    tok = BertTokenizer.from_pretrained("bert-base-multilingual-cased", **kwargs)
+    mdl = BertForMaskedLM.from_pretrained("bert-base-multilingual-cased", **kwargs)
+    return tok, mdl
+
+
+def load_w2v_cached(mode_tag: str) -> Tuple[Optional[Word2Vec], Optional[Word2Vec]]:
+    """Load trained Word2Vec CBOW and SG from models/{MODE}/; no training."""
+    base = models_dir / mode_tag
+    cbow_path = base / "w2v_cbow.model"
+    sg_path = base / "w2v_sg.model"
+    cbow = Word2Vec.load(str(cbow_path)) if cbow_path.exists() else None
+    sg = Word2Vec.load(str(sg_path)) if sg_path.exists() else None
+    return cbow, sg
+
+
+def load_bert_finetuned_cached(
+    mode_tag: str,
+    allow_degrade: bool = True
+) -> Tuple[BertTokenizer, Optional[Union[BertForMaskedLM, PeftModel]], Optional[Path]]:
+    """
+    Prefer HF-style checkpoint under models/{MODE}/bert_cased/ (root contains config.json + model weights),
+    else support meta.json → best_epoch_* layout, else fall back to Paper-1 'bert_final.pt' state_dict.
+    If adapter-only weights are present (adapter_config.json + adapter_model.safetensors), load base BERT then the adapter.
+    If the adapter cannot be activated, fall back to base BERT (do not abort runs due to adapter unavailability).
+    Returns tokenizer, model (or None), and the checkpoint path used (None means base).
+    """
+    revision = cfg.get("hf_revision")
+    root = models_dir / mode_tag / "bert_cased"
+
+    # 1) Direct HF-style checkpoint saved at root
+    if root.exists() and (root / "config.json").exists() and (
+        (root / "pytorch_model.bin").exists() or (root / "model.safetensors").exists()
+    ):
+        logger.info(f"[{mode_tag}] Loading finetuned BERT from HF-style cache: {root}")
+        tok = BertTokenizer.from_pretrained(str(root))
+        mdl = BertForMaskedLM.from_pretrained(str(root))
+        mdl.to(device); mdl.eval()
+        return tok, mdl, root
+
+    # 1a) PEFT / LoRA checkpoint check (Matches Code 1's fine-tuning output)
+    # Check for files like adapter_config.json AND adapter_model.safetensors/.bin
+    is_peft_dir = root.exists() and (root / "adapter_config.json").exists() and \
+                  ((root / "adapter_model.safetensors").exists() or (root / "adapter_model.bin").exists())
+
+    if is_peft_dir:
+        logger.info(f"[{mode_tag}] Attempting to load base BERT with PEFT adapter from: {root}")
+        try:
+            # Load the base model first using the helper function
+            tok, base_model = _hf_from_pretrained_base(revision)
+            # Ensure the base model is on the correct device *before* loading the adapter
+            base_model.to(device)
+            mdl: Union[BertForMaskedLM, PeftModel] = PeftModel.from_pretrained(base_model, str(root))
+            mdl.to(device)
+            mdl.eval()  # Ensure final model is on device and in eval mode
+            logger.info(f"[{mode_tag}] Successfully loaded finetuned BERT with PEFT adapter from {root}")
+            return tok, mdl, root  # Return the PEFT model
+        except Exception as e:
+            import traceback
+            logger.warning(f"[{mode_tag}] PEFT adapter load failed from {root}: {e}")
+            logger.debug(traceback.format_exc())
+            logger.warning(f"[{mode_tag}] Proceeding with fallback loading options...")
+
+    # 2) meta.json → best_epoch_* support
+    meta = root / "meta.json"
+    if meta.exists():
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        best = data.get("best_epoch")
+        ckpt_dir = (root / f"best_epoch_{best}") if best is not None else None
+        if ckpt_dir is None:
+            candidates = sorted(root.glob("best_epoch_*"))
+            ckpt_dir = candidates[-1] if candidates else None
+        if ckpt_dir and ckpt_dir.exists():
+            logger.info(f"[{mode_tag}] Loading finetuned BERT from best-epoch directory: {ckpt_dir}")
+            tok = (BertTokenizer.from_pretrained("bert-base-multilingual-cased", revision=revision)
+                   if revision else BertTokenizer.from_pretrained("bert-base-multilingual-cased"))
+            mdl = BertForMaskedLM.from_pretrained(str(ckpt_dir))
+            mdl.to(device); mdl.eval()
+            return tok, mdl, ckpt_dir
+
+    # 3) Fallback to Paper 1 state_dict format
+    pt_path = models_dir / mode_tag / "bert_final.pt"
+    if pt_path.exists():
+        logger.info(f"[{mode_tag}] Loading finetuned BERT from state_dict: {pt_path.name}")
+        tok, mdl = _hf_from_pretrained_base(revision)
+        state = torch.load(str(pt_path), map_location="cpu")
+        mdl.load_state_dict(state, strict=False)
+        mdl.to(device); mdl.eval()
+        return tok, mdl, pt_path
+
+    # 4) No finetuned model found
+    if allow_degrade:
+        logger.warning(f"[{mode_tag}] Finetuned BERT missing; degrading to base bert-base-multilingual-cased.")
+        tok, mdl = _hf_from_pretrained_base(revision)
+        mdl.to(device); mdl.eval()
+        return tok, mdl, None
+
+    logger.error(f"[{mode_tag}] Finetuned BERT missing and degrade disabled.")
+    tok = (BertTokenizer.from_pretrained("bert-base-multilingual-cased", revision=revision)
+           if revision else BertTokenizer.from_pretrained("bert-base-multilingual-cased"))
+    return tok, None, None
+
+
+# =========================
+# Embedding helpers  (PAPER-1 COMPATIBLE)
+# =========================
+def w2v_vecs_for_terms(terms: List[str], model: Word2Vec) -> Dict[str, np.ndarray]:
+    """Return a dict mapping each term to its Word2Vec vector if present."""
+    out: Dict[str, np.ndarray] = {}
+    for t in _pbar(terms, desc="W2V terms"):
+        if t in model.wv:
+            out[t] = model.wv[t]
+    return out
+
+
+def _boundary_regex(word: str) -> re.Pattern:
+    """
+    Build a strict word-boundary regex for ASCII-ish tokens so 'ma' won't match 'information'.
+    For non-Latin content, fall back to plain substring finditer.
+    """
+    # ASCII-ish: use explicit class for 'word' characters (letters/digits/_)
+    return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])", flags=re.IGNORECASE)
+
+
+def _stable_subsample(seq: List[str], k: int, tag: str) -> List[str]:
+    """Deterministically shuffle + subsample based on a tag (Paper-1 style)."""
+    h = int(hashlib.sha256(tag.encode("utf-8")).hexdigest(), 16) % (2**32)
+    r = random.Random(h)
+    base = sorted(list(seq))
+    r.shuffle(base)
+    return base[:k]
+
+
+@torch.no_grad()
+def get_contextual_bert_vectors(
+        term: str,
+        mdl: Union[BertForMaskedLM, PeftModel],
+        tok: BertTokenizer,
+        corpus_path: Path,
+        max_sentences: int = 100,  # FIX: Match Paper 1's max_samples=100
+) -> Optional[np.ndarray]:
+    """
+    PAPER-1 LOGIC FOR PARITY:
+      1) Collect sentences containing the target (word-boundary aware)
+      2) Deterministically sample up to max_sentences
+      3) Average final-layer *all-token* (non-special) embeddings across all matches
+    """
+    if mdl is None or not corpus_path.exists():
+        return None
+
+    # 1) Load and split into sentences (one per line)
+    text = corpus_path.read_text(encoding="utf-8")
+    sentences = [s.strip() for s in SENT_SPLIT_RE_P1.split(text) if s.strip()]
+
+    # Calculate sent_hash
+    sent_hash = hashlib.sha256("".join(sorted(sentences)).encode()).hexdigest()[:8]
+
+    # 2) Find sentences containing the word (word-boundaries)
+    pat = _boundary_regex(term)
+    hits = [s for s in sentences if pat.search(s)]
+    if not hits:
+        return None
+
+    # 3) Deterministic subsample
+    corpus_sha = sha256_file_p1(corpus_path)
+    tag = f"ctx:{term}:{corpus_sha}:{sent_hash}"
+    sampled_hits = _stable_subsample(hits, min(len(hits), max_sentences), tag=tag)
+
+    # 4) Encode and average all non-special tokens
+    mdl.eval()
+    ctx_vecs = []
+    max_len = int(cfg.get("bert_final", {}).get("max_length", 128))
+
+    # Ensure model is on the correct device once, outside the loop
+    mdl.to(device)
+
+    for s in _pbar(sampled_hits, desc=f"contexts:{term}", leave=False):
+        toks = tok(s, add_special_tokens=True, truncation=True, max_length=max_len, return_tensors="pt")
+        if len(toks["input_ids"][0]) < 3:  # Skip if only [CLS], [SEP]
+            continue
+
+        toks = {k: v.to(device) for k, v in toks.items()}
+
+        # IMPORTANT FIX: call the PEFT-wrapped model directly so adapters are active.
+        out = mdl(**toks, output_hidden_states=True)
+        hidden = out.hidden_states[-1].squeeze(0)  # [seq_len, hidden]
+
+        # Average non-special tokens
+        emb = hidden[1:-1, :].mean(dim=0).detach().cpu().numpy()
+        ctx_vecs.append(emb)
+
+    if not ctx_vecs:
+        return None
+
+    return np.mean(np.stack(ctx_vecs), axis=0)
+
+
+def bert_vecs_for_terms(terms: List[str], tok: BertTokenizer, mdl: Optional[Union[BertForMaskedLM, PeftModel]], corpus_path: Path) -> Dict[str, np.ndarray]:
+    """Return a dict mapping each term to its contextual BERT vector averaged over regex-matched contexts."""
+    out: Dict[str, np.ndarray] = {}
+    if mdl is None:
+        return out
+    for t in _pbar(terms, desc="BERT terms"):
+        v = get_contextual_bert_vectors(t, mdl, tok, corpus_path)
+        if v is not None:
+            out[t] = v
+    return out
+
+
+# =========================
+# Clustering
+# =========================
+def calculate_mean_ari(grouping: Dict[str, int],
+                       clusterings: List[Dict[str, int]],
+                       words: List[str]) -> float:
+    """
+    Calculate the mean ARI between a grouping and multiple clusterings.
+
+    Args:
+        grouping: The {term: 0/1} map representing the grouping.
+        clusterings: A list of {term: cluster_id} dictionaries.
+        words: The list of words considered (used for intersection).
+
+    Returns:
+        The mean ARI across clusterings, or NaN if no valid comparisons possible.
+    """
+    mean_vals = []
+    for clus in clusterings:
+        # Find common words for *this specific comparison*
+        common_words_comparison = [w for w in words if w in grouping and w in clus]
+        if len(common_words_comparison) < 3:
+            continue # Skip if too few words for meaningful ARI
+
+        y_true = [grouping[w] for w in common_words_comparison]
+        y_pred = [clus[w] for w in common_words_comparison]
+        mean_vals.append(_ari(y_true, y_pred))
+
+    # Check if mean_vals is empty before calculating mean
+    return float(np.mean(mean_vals)) if mean_vals else float("nan")
+
+def kmeans_clusters(embeddings: Dict[str, np.ndarray], k: int, use_l2: bool = True) -> Dict[str, int]:
+    """Cluster term embeddings with K-Means, returning {term: cluster_id}."""
+    if not embeddings:
+        return {}
+    labels = list(embeddings.keys())
+    x = np.stack([embeddings[w] for w in labels], axis=0)
+    if use_l2:
+        x = l2_normalise(x)
+    if use_zscore:
+        x = (x - x.mean(0)) / (x.std(0) + 1e-8)
+    km = KMeans(n_clusters=k, n_init=kmeans_n_init, max_iter=kmeans_max_iter, random_state=seed)
+    y = km.fit_predict(x)
+    return {w: int(c) for w, c in zip(labels, y)}
+
+
+# =========================
+# ARI utilities: confirmatory parity, bootstrap, permutation test
+# =========================
+def confirmatory_ari_parity(mode: str, model_tag: str, clusters: Dict[str, int]) -> None:
+    """Compute ARI(gold_labels, clusters) using Paper-1 hypothesis if available."""
+    # 1) old location (top-level)
+    conf = cfg.get("paper1_confirmatory", {})
+    gold = conf.get("gold_labels", {})
+
+    # 2) fallback to your current YAML structure
+    if not gold:
+        p1 = cfg.get("ari_settings", {}).get("paper1_confirmatory", {})
+        active = p1.get("active_hypothesis")
+        gold = (p1.get("hypotheses", {}) or {}).get(active, {})
+
+    if not gold:
+        return
+
+    common = [w for w in gold if w in clusters]
+    if len(common) < 3:
+        return
+
+    y_true = [gold[w] for w in common]
+    y_pred = [clusters[w] for w in common]
+    val = _ari(y_true, y_pred)
+    pd.DataFrame([{
+        "Mode": mode, "Model": model_tag, "ARI_confirmatory": val, "N": len(common)
+    }]).to_csv(res_dir / f"paper2_confirmatory_parity_{mode.lower()}_{model_tag.lower()}.csv", index=False)
+
+
+def bootstrap_ari(grouping: Dict[str, int], clusterings: List[Dict[str, int]], words: List[str],
+                  b: int = 2000, ci: float = 0.95, rng: Optional[random.Random] = None) -> Tuple[float, float, float, float]:
+    """Bootstrap mean ARI over resampled word sets; returns (mean, std, ci_low, ci_high)."""
+    if rng is None:
+        rng = random.Random(ari_seed)
+    scores: List[float] = []
+    common = [w for w in words if any(w in c for c in clusterings)]
+    if len(common) < 3:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    for _ in _pbar(range(b), desc=f"Bootstrap b={b}"):
+        sample = [common[rng.randrange(len(common))] for _ in range(len(common))]
+        per_clus = []
+        for clus in clusterings:
+            inter = [w for w in sample if w in clus]
+            if len(inter) < 3:
+                continue
+            y_true = [grouping[w] for w in inter]
+            y_pred = [clus[w] for w in inter]
+            per_clus.append(_ari(y_true, y_pred))
+        if per_clus:
+            scores.append(float(np.mean(per_clus)))
+    if not scores:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    arr = np.array(scores, dtype=np.float32)
+    m, s = float(np.mean(arr)), float(np.std(arr, ddof=1) if len(arr) > 1 else 0.0)
+    alpha = (1.0 - ci) / 2.0
+    lo, hi = float(np.quantile(arr, alpha)), float(np.quantile(arr, 1.0 - alpha))
+    return m, s, lo, hi
+
+
+def permutation_p_value(grouping: Dict[str, int], clusterings: List[Dict[str, int]], words: List[str],
+                        r: int = 500, rng: Optional[random.Random] = None) -> float:
+    """Permutation test: shuffle labels preserving group sizes; return one-sided p-value for mean ARI ≥ observed."""
+    if rng is None:
+        rng = random.Random(ari_seed)
+
+    # Use words available in *any* clustering for the permutation base set
+    common = [w for w in words if any(w in c for c in clusterings) and w in grouping]
+    if len(common) < 3:
+        return float("nan")
+
+    # Calculate observed mean ARI using the utility function
+    # Pass 'common' - the set of words relevant for this grouping & clusterings
+    obs = calculate_mean_ari(grouping, clusterings, common)
+    if math.isnan(obs):
+        # If observed ARI is NaN (e.g., no valid comparisons), p-value is also NaN
+        return float("nan")
+
+    counts = sum(1 for w in common if grouping.get(w, 0) == 1)
+    p_ge = 0
+    for _ in _pbar(range(r), desc=f"Permutation r={r}"):
+        perm_labels = [1] * counts + [0] * (len(common) - counts)
+        rng.shuffle(perm_labels)
+        perm_map = {w: perm_labels[i] for i, w in enumerate(common)}
+
+        # Calculate ARI for the permuted map using the utility function
+        val = calculate_mean_ari(perm_map, clusterings, common)
+
+        # Check for NaN result from calculate_mean_ari before comparison
+        if not math.isnan(val) and val >= obs:
+            p_ge += 1
+
+    # Return p-value using the standard formula
+    return (p_ge + 1) / (r + 1)
+
+
+# =========================
+# Exploratory ARI search
+# =========================
+def enumerate_all_binary(words: List[str], clusterings: List[Dict[str, int]]) -> List[Tuple[float, Dict[str, int]]]:
+    """Exhaustive non-trivial binary assignments; returns sorted list of (mean_ari, grouping)."""
+    n = len(words)
+    results: List[Tuple[float, Dict[str, int]]] = []
+    total = (1 << (n - 1)) - 1  # skip trivial all-same
+    for mask in _pbar(range(1, 1 << (n - 1)), total=total, desc=f"ARI enumerate n={n}"):
+        groups = {words[0]: 0}
+        for j in range(1, n):
+            groups[words[j]] = (mask >> (j - 1)) & 1
+        if len(set(groups.values())) < 2:
+            continue
+        scores = []
+        for clus in clusterings:
+            common = [w for w in words if w in clus]
+            if len(common) < 3:
+                continue
+            y_true = [groups[w] for w in common]
+            y_pred = [clus[w] for w in common]
+            scores.append(_ari(y_true, y_pred))
+        if scores:
+            results.append((float(np.mean(scores)), groups))
+    results.sort(key=lambda t: t[0], reverse=True)
+    return results
+
+
+def heuristic_search_binary(words: List[str], embeddings: Dict[str, np.ndarray],
+                            clusterings: List[Dict[str, int]],
+                            max_samples_limit: int, seed_for_rng: int) -> List[Tuple[float, Dict[str, int]]]:
+    """
+    Deterministic heuristic: PC1 sign initialisation + single-pivot flips + seeded random masks until max_samples_limit reached.
+    Returns sorted list of (mean_ari, grouping).
+    """
+    rng = np.random.default_rng(seed_for_rng)
+    # Ensure words used for PCA initialization are present in embeddings
+    labels_in_embeddings = [w for w in words if w in embeddings]
+
+    # Initialize map: default to 0, use PCA if possible
+    init_map = {w: 0 for w in words}
+
+    if len(labels_in_embeddings) >= 2: # Need at least 2 points for PCA
+        w_mat = np.stack([embeddings[w] for w in labels_in_embeddings], axis=0)
+        w_mat = l2_normalise(w_mat)
+        # Ensure n_components is less than n_samples
+        n_components = min(1, w_mat.shape[0] -1)
+        if n_components >= 1:
+            try:
+                pc1 = PCA(n_components=n_components, random_state=seed_for_rng).fit_transform(w_mat).ravel()
+                # Update init_map only for words used in PCA
+                for i, w in enumerate(labels_in_embeddings):
+                    init_map[w] = (1 if pc1[i] >= 0.0 else 0)
+            except ValueError as e:
+                 logger.warning(f"PCA failed during heuristic search initialization (n_samples={w_mat.shape[0]}): {e}. Falling back to default init.")
+                 # Fallback if PCA fails (e.g., all points identical)
+                 half = len(words) // 2
+                 init_map = {w: int(i < half) for i, w in enumerate(words)}
+        else:
+             # Fallback if not enough samples for PCA
+             half = len(words) // 2
+             init_map = {w: int(i < half) for i, w in enumerate(words)}
+    else:
+        # Fallback if too few words have embeddings
+        half = len(words) // 2
+        init_map = {w: int(i < half) for i, w in enumerate(words)}
+
+
+    candidates: Dict[str, float] = {}
+
+    # Calculate initial score using the utility function
+    # Pass the full 'words' list relevant to this search
+    s0 = calculate_mean_ari(init_map, clusterings, words)
+    key0 = ",".join(str(init_map[w]) for w in words)
+    if not math.isnan(s0): # Only add if the score is valid
+        candidates[key0] = s0
+
+    # Pivots
+    pivots = words[:]
+    random.Random(seed_for_rng).shuffle(pivots)
+    pivots = pivots[: min(100, len(pivots))] # Limit pivots for efficiency
+    for p in _pbar(pivots, desc="ARI pivots", total=len(pivots)):
+        cand_map = init_map.copy()
+        cand_map[p] = 1 - cand_map[p]
+        # Skip trivial groupings (all 0s or all 1s)
+        if len(set(cand_map.values())) < 2:
+            continue
+        key = ",".join(str(cand_map[w]) for w in words)
+        if key in candidates:
+            continue
+        # Use the utility function
+        score = calculate_mean_ari(cand_map, clusterings, words)
+        if not math.isnan(score): # Only add valid scores
+             candidates[key] = score
+
+    # Random masks
+    needed = max(0, max_samples_limit - len(candidates))
+    attempts = 0 # Prevent infinite loops if valid random masks are hard to find
+    max_attempts = needed * 5 + 100 # Allow some extra attempts
+
+    for _ in _pbar(range(needed), desc=f"ARI random masks", total=needed):
+        if attempts >= max_attempts:
+            logger.warning(f"Reached max attempts ({max_attempts}) generating random masks.")
+            break
+
+        while attempts < max_attempts:
+            attempts += 1
+            bits = rng.integers(0, 2, size=len(words))
+            # Ensure non-trivial grouping
+            if bits.sum() == 0 or bits.sum() == len(words):
+                # Flip a random bit to make it non-trivial
+                 idx_to_flip = rng.integers(0, len(words))
+                 bits[idx_to_flip] = 1 - bits[idx_to_flip]
+                 # If it became trivial again (only possible if len(words)==1), skip (though len(words)>=3 assumed)
+                 if bits.sum() == 0 or bits.sum() == len(words): continue
+
+
+            cand_map = {w: int(bits[i]) for i, w in enumerate(words)}
+            key = ",".join(str(cand_map[w]) for w in words)
+
+            if key not in candidates:
+                # Use the utility function
+                score = calculate_mean_ari(cand_map, clusterings, words)
+                if not math.isnan(score): # Only add valid scores
+                    candidates[key] = score
+                    break # Found a new valid candidate, move to next needed mask
+            # If key exists or score is NaN, loop continues to find another random mask
+
+    # Filter out NaN scores before creating the final list
+    out = [(v, {w: int(k.split(",")[i]) for i, w in enumerate(words)})
+           for k, v in candidates.items() if not math.isnan(v)]
+    out.sort(key=lambda t: t[0], reverse=True)
+    return out
+
+
+# =========================
+# Visuals
+# =========================
+def plot_similarity_web(embeddings: Dict[str, np.ndarray],
+                        clusters: Dict[str, int],
+                        title: str,
+                        out_path: Path,
+                        group0_name: Optional[str] = None,
+                        group1_name: Optional[str] = None
+                        ) -> None:
+    """Similarity web with edge pruning, MST connectivity, weight-coded edges,
+       cluster-colored nodes, legend, and square frame with cluster-colored edges."""
+    if len(embeddings) < 2:
+        logger.warning(f"Not enough terms for similarity web: {len(embeddings)}")
+        return
+
+    labels = list(embeddings.keys())
+    x = np.stack([embeddings[w] for w in labels], axis=0)
+    x = l2_normalise(x)
+    sim = cosine_similarity(x)
+
+    g_full = nx.Graph()
+    for i, a in enumerate(labels):
+        for j in range(i + 1, len(labels)):
+            weight = float(sim[i, j])
+            if i != j and not math.isnan(weight) and not math.isinf(weight):
+                g_full.add_edge(a, labels[j], weight=weight)
+
+    weights_all = np.array([d["weight"] for _, _, d in g_full.edges(data=True) if
+                            "weight" in d and not math.isnan(d["weight"]) and not math.isinf(d["weight"])],
+                           dtype=np.float32)
+    if len(weights_all) == 0:
+        logger.warning(f"No valid pairwise similarities for {title}")
+
+    q_cut = float(np.quantile(weights_all, web_q)) if len(weights_all) > 0 else sim_threshold
+    keep_edges = set()
+
+    for v in g_full.nodes():
+        nbrs = [(v, u, g_full[v][u]["weight"]) for u in g_full.neighbors(v)
+                if g_full.has_edge(v, u) and "weight" in g_full[v][u] and
+                not math.isnan(g_full[v][u]["weight"]) and not math.isinf(g_full[v][u]["weight"])]
+        nbrs.sort(key=lambda t: t[2], reverse=True)
+        for a, b, w in nbrs[:max(1, web_topk)]:
+            if w >= max(sim_threshold, q_cut):
+                keep_edges.add(tuple(sorted((a, b))))
+
+    if web_use_mst:
+        if g_full.number_of_edges() > 0:
+            try:
+                g_valid_weights = nx.Graph()
+                g_valid_weights.add_nodes_from(g_full.nodes())
+                valid_edges = [(u, v, d) for u, v, d in g_full.edges(data=True)
+                               if "weight" in d and not math.isnan(d["weight"]) and not math.isinf(d["weight"])]
+                g_valid_weights.add_edges_from(valid_edges)
+
+                if g_valid_weights.number_of_edges() > 0:
+                    connected_components = list(nx.connected_components(g_valid_weights))
+                    if len(connected_components) == 1:
+                        mst = nx.maximum_spanning_tree(g_valid_weights, weight="weight")
+                        keep_edges.update(tuple(sorted(e)) for e in mst.edges())
+                    else:
+                        logger.warning(
+                            f"Skipping MST for '{title}' as graph with valid weights is not connected ({len(connected_components)} components).")
+                else:
+                    logger.warning(f"Skipping MST for '{title}' as graph has no valid edges for MST.")
+
+            except nx.NetworkXError as e:
+                logger.warning(f"Could not compute MST for '{title}': {e}")
+        else:
+            logger.warning(f"Skipping MST for '{title}' as the full graph has no edges.")
+
+    g = nx.Graph()
+    g.add_nodes_from(g_full.nodes())
+    for a, b in keep_edges:
+        if g_full.has_edge(a, b) and "weight" in g_full[a][b]:
+            weight = g_full[a][b]["weight"]
+            if not math.isnan(weight) and not math.isinf(weight):
+                g.add_edge(a, b, weight=weight)
+
+    if g.number_of_edges() == 0 and g.number_of_nodes() > 0:
+        logger.warning(f"No edges survive pruning for {title} (try lowering web_q or raising topk)")
+
+    deg = nx.degree_centrality(g)
+    bet = nx.betweenness_centrality(g, weight=None) if g.number_of_nodes() > 0 else {}
+
+    sizes = []
+    for v in g.nodes():
+        base = 350.0 + 1400.0 * deg.get(v, 0.0)
+        if v in hilite:
+            base *= 1.35
+        sizes.append(base)
+
+    k_val = 1.1 / math.sqrt(max(1, g.number_of_nodes()))
+    layout_weight = "weight" if g.number_of_edges() > 0 else None
+
+    pos = {}
+    if g.number_of_nodes() > 0:
+        try:
+            pos = nx.spring_layout(g, seed=seed, k=k_val, iterations=250, weight=layout_weight)
+        except nx.NetworkXError as e:
+            logger.error(f"Spring layout failed for '{title}': {e}. Falling back to random layout.")
+            pos = nx.random_layout(g, seed=seed)
+        except ImportError:
+            logger.warning(f"Spring layout dependency might be missing. Falling back to random layout.")
+            pos = nx.random_layout(g, seed=seed)
+    else:
+        logger.warning(f"Skipping layout calculation for '{title}' as graph has no nodes.")
+
+    # --- Node colors and names from config ---
+    name0 = group0_name if group0_name else "Cluster 0 (conceptual)"
+    name1 = group1_name if group1_name else "Cluster 1 (physical)"
+    name_unassigned = "Unassigned"
+    inter_cluster_name = "Inter-Cluster"
+
+    plotting_cfg = cfg.get("plotting", {})
+    palette_cfg = plotting_cfg.get("palette", {})
+    color0 = palette_cfg.get("cluster0", "#f59d05")
+    color1 = palette_cfg.get("cluster1", "#529a54")
+    color_unassigned = palette_cfg.get("unassigned", "#808080")
+    color_inter_cluster = palette_cfg.get("inter_cluster_edge", "#a0a0a0")
+
+    # FIX: Explicitly define dictionaries to handle potential mixed key types if needed later
+    palette_colors: Dict[Union[int, str], str] = {
+        0: color0,
+        1: color1,
+        -1: color_unassigned,
+        'inter': color_inter_cluster  # Add 'inter' key directly
+    }
+    palette_names: Dict[Union[int, str], str] = {
+        0: name0,
+        1: name1,
+        -1: name_unassigned,
+        'inter': inter_cluster_name  # Add 'inter' key directly
+    }
+
+    node_colors = []
+    present_clusters = set()
+    for node in g.nodes():
+        cluster_id = clusters.get(node, -1)
+        present_clusters.add(cluster_id)
+        node_colors.append(palette_colors.get(cluster_id, color_unassigned))
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(figsize=(12, 12))
+
+    # FIX: Initialize edge_legend_colors before the loop
+    edge_legend_colors = {'same_0': False, 'same_1': False, 'inter': False}
+    edge_colors = []  # Also initialize edge_colors here
+
+    if g.number_of_edges() > 0:
+        ew = [g[u][v]["weight"] for u, v in g.edges()]
+        w_min, w_max = min(ew), max(ew)
+        w_range = w_max - w_min if w_max > w_min else 1.0
+        widths = [0.6 + 3.2 * ((w - w_min) / w_range) for w in ew]
+        alphas = [0.25 + 0.55 * ((w - w_min) / w_range) for w in ew]
+
+        # Calculate edge colors
+        for u, v in g.edges():
+            u_cluster = clusters.get(u, -1)
+            v_cluster = clusters.get(v, -1)
+
+            if u_cluster == v_cluster and u_cluster != -1:  # Both nodes in the same KNOWN cluster
+                edge_colors.append(palette_colors.get(u_cluster, color_unassigned))
+                if u_cluster == 0:
+                    edge_legend_colors['same_0'] = True
+                elif u_cluster == 1:
+                    edge_legend_colors['same_1'] = True
+            else:  # Different clusters or involves an unassigned node
+                edge_colors.append(palette_colors['inter'])  # Use 'inter' key
+                edge_legend_colors['inter'] = True
+
+        nx.draw_networkx_edges(g, pos, ax=ax, width=widths, alpha=alphas, edge_color=edge_colors)
+    elif g.number_of_nodes() > 0:
+        logger.info(f"Skipping edge drawing for '{title}' as pruned graph has no edges.")
+
+    if g.number_of_nodes() > 0:
+        nx.draw_networkx_nodes(g, pos, ax=ax, node_size=sizes, alpha=0.95, node_color=node_colors)
+        nx.draw_networkx_labels(
+            g, pos, ax=ax, font_size=web_label_fs,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7)
+        )
+
+    ax.set_title(title)  # Use ax.set_title when using axes object
+
+    # --- Square Frame and Aspect Ratio ---
+    if pos:
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_axis_on()
+
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color('black')
+            spine.set_linewidth(1)
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+        x_vals, y_vals = zip(*pos.values()) if pos else ([], [])
+        if x_vals and y_vals:
+            x_min, x_max = min(x_vals), max(x_vals)
+            y_min, y_max = min(y_vals), max(y_vals)
+
+            x_range = x_max - x_min if x_max > x_min else 0.1
+            y_range = y_max - y_min if y_max > y_min else 0.1
+
+            buffer_x = x_range * 0.05
+            buffer_y = y_range * 0.05
+
+            ax.set_xlim(x_min - buffer_x, x_max + buffer_x)
+            ax.set_ylim(y_min - buffer_y, y_max + buffer_y)
+    else:
+        plt.axis("off")
+
+    # --- Legend ---
+    legend_handles = []
+    # Node legend
+    # Use mlines.Line2D for clarity
+    for cid in sorted(list(present_clusters)):
+        if cid != -1 or (cid == -1 and palette_names.get(cid) == name_unassigned):
+            legend_handles.append(
+                mlines.Line2D([], [], color='w', marker='o',
+                              label=palette_names.get(cid, f"Cluster {cid}"),
+                              markerfacecolor=palette_colors.get(cid, color_unassigned),
+                              markersize=10, linestyle='None')
+            )
+
+    # Edge legend section
+    # Check edge_legend_colors which is now guaranteed to exist
+    if g.number_of_edges() > 0 and (
+            edge_legend_colors['same_0'] or edge_legend_colors['same_1'] or edge_legend_colors['inter']):
+        legend_handles.append(mlines.Line2D([], [], color='none', label='', marker='None', linestyle='None'))
+        legend_handles.append(
+            mlines.Line2D([], [], color='none', label='--- Edge Colors ---', marker='None', linestyle='None'))
+
+        if edge_legend_colors['same_0']:
+            legend_handles.append(
+                mlines.Line2D([], [], color=palette_colors[0], marker='_',  # Use int key
+                              label=f"Within {palette_names[0]}",
+                              markersize=15, linestyle='-', linewidth=2)
+            )
+        if edge_legend_colors['same_1']:
+            legend_handles.append(
+                mlines.Line2D([], [], color=palette_colors[1], marker='_',  # Use int key
+                              label=f"Within {palette_names[1]}",
+                              markersize=15, linestyle='-', linewidth=2)
+            )
+        if edge_legend_colors['inter']:
+            legend_handles.append(
+                mlines.Line2D([], [], color=palette_colors['inter'], marker='_',  # FIX: Use 'inter' key
+                              label=palette_names['inter'],  # FIX: Use 'inter' key
+                              markersize=15, linestyle='-', linewidth=2)
+            )
+
+    if legend_handles:
+        ax.legend(handles=legend_handles, title="Legend",  # Changed title slightly
+                  bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.)
+
+    fig.tight_layout(rect=(0, 0, 0.88, 1))
+
+    plt.savefig(out_path, metadata={"Date": None}, bbox_inches='tight')
+    plt.close(fig)
+
+    # Save centrality measures
+    if g.number_of_nodes() > 0:
+        df = pd.DataFrame({
+            "term": list(g.nodes()),
+            "degree": [deg.get(n, 0.0) for n in g.nodes()],
+            "betweenness": [bet.get(n, 0.0) for n in g.nodes()],
+        }).sort_values(by=["degree", "betweenness"], ascending=[False, False])
+        df.to_csv(out_path.with_suffix(".csv"), index=False)
+    else:
+        logger.info(f"No nodes to save centrality measures for '{title}'.")
+
+
+def plot_tsne_map(embeddings: Dict[str, np.ndarray],
+                    clusters: Dict[str, int],
+                    title: str,
+                    out_path: Path,
+                    group0_name: Optional[str] = None, # <-- ADDED
+                    group1_name: Optional[str] = None  # <-- ADDED
+                    ) -> None:
+    """Compute PCA-initialised t-SNE over terms and plot with labels coloured by cluster id and legend."""
+    if len(embeddings) < 3:
+        logger.warning(f"Skipping t-SNE for '{title}' because only {len(embeddings)} term(s) available.")
+        return
+    labels = list(embeddings.keys())
+    x = np.stack([embeddings[w] for w in labels], axis=0)
+    x = l2_normalise(x)
+
+    n_pca = max(1, min(tsne_pca_dims, x.shape[0] - 1))
+    x_pca = PCA(n_components=n_pca, random_state=seed).fit_transform(x)
+
+    # Calculate perplexity, ensuring it's less than n_samples
+    n_samples = x_pca.shape[0]
+    perp = max(2, (n_samples - 1) // tsne_perp_div)
+    if perp >= n_samples:
+        # Reduce perplexity if it's too high for the sample size
+        perp = max(1, n_samples - 1)
+        logger.warning(f"Reduced t-SNE perplexity to {perp} for '{title}' due to small sample size ({n_samples}).")
+        if perp == 1: # TSNE requires perplexity > 1 for Barnes-Hut
+             logger.warning(f"Skipping t-SNE for '{title}' due to perplexity being 1 (method='exact' requires > 1).")
+             return
+
+    # Use 'exact' method for small datasets as recommended, handle potential issues
+    tsne_method = 'exact' if n_samples < 50 else 'barnes_hut' # Adjust threshold as needed
+    try:
+        tsne = TSNE(perplexity=perp, random_state=seed, method=tsne_method, n_iter=1500, early_exaggeration=8.0) # Added params from config
+        x_2d = tsne.fit_transform(x_pca)
+    except ValueError as e:
+        logger.error(f"t-SNE failed for '{title}' with perplexity={perp}, n_samples={n_samples}. Error: {e}")
+        return
+
+
+    cids = [clusters.get(w, -1) for w in labels]
+
+    # Use provided names if available, otherwise default
+    name0 = group0_name if group0_name else "Cluster 0"
+    name1 = group1_name if group1_name else "Cluster 1"
+    name_unassigned = "Unassigned"
+
+    # Map cluster ID to name AND color
+    # Consider reading colors from config
+    plotting_cfg = cfg.get("plotting", {})
+    palette_cfg = plotting_cfg.get("palette", {})
+    color0 = palette_cfg.get("cluster0", "#f59d05")
+    color1 = palette_cfg.get("cluster1", "#529a54")
+    color_unassigned = palette_cfg.get("unassigned", "#808080")
+
+    palette_colors = {0: color0, 1: color1, -1: color_unassigned}
+    palette_names = {0: name0, 1: name1, -1: name_unassigned}
+
+
+    cols = [palette_colors.get(cid, color_unassigned) for cid in cids]
+
+    plt.figure(figsize=(10, 10))
+    plt.scatter(x_2d[:, 0], x_2d[:, 1], c=cols, alpha=0.95, s=60)
+    for i, lab in enumerate(labels):
+        plt.annotate(lab, (x_2d[i, 0], x_2d[i, 1]), textcoords="offset points", xytext=(0,5), ha='center', fontsize=9) # Fine-tune annotation
+    plt.title(title)
+    plt.xlabel("t-SNE Component 1") # Add axis labels
+    plt.ylabel("t-SNE Component 2")
+
+    # --- Add Legend ---
+    legend_handles = []
+    # Create handles only for clusters actually present
+    present_clusters = sorted([c for c in set(cids)]) # Include -1 if present
+    for cid in present_clusters:
+        legend_handles.append(
+            plt.Line2D([0], [0], marker='o', color='w', # Use 'w' for background invisible line
+                       label=palette_names.get(cid, f"Cluster {cid}"),
+                       markerfacecolor=palette_colors.get(cid, color_unassigned),
+                       markersize=10, linestyle='None') # No line style
+        )
+    if legend_handles:
+        plt.legend(handles=legend_handles, title="Cluster Assignment", loc='best') # Let matplotlib decide best location
+    # --- END ---
+
+    plt.tight_layout()
+    plt.savefig(out_path, metadata={"Date": None})
+    plt.close()
+
+
+def plot_hierarchical(embeddings: Dict[str, np.ndarray],
+                      clusters: Dict[str, int],
+                      title_tag: str,
+                      out_dir: Path) -> None:
+    """Create cosine-distance linkage dendrogram (with colored labels and branches) and a clustermap heat-map for terms."""
+    if len(embeddings) < 3:
+        logger.warning(f"Skipping hierarchical plots for '{title_tag}': need ≥3 terms, got {len(embeddings)}.")
+        return
+
+    labels = list(embeddings.keys())
+    labels.sort()
+    x = np.stack([embeddings[w] for w in labels], axis=0)
+    x = l2_normalise(x)
+
+    t0 = time.perf_counter()
+    try:
+        dist_matrix = pdist(x, metric="cosine")
+        z = linkage(dist_matrix, method="average")
+        logger.info(f"[{title_tag}] linkage computed in {time.perf_counter() - t0:.2f}s")
+    except ValueError as e:
+        logger.error(f"Could not compute linkage matrix for '{title_tag}': {e}")
+        return  # Cannot proceed without linkage
+
+    # Calculate threshold for the standalone dendrogram
+    max_d_height = z[:, 2].max()
+    dendrogram_color_threshold = 0.7 * max_d_height  # Heuristic
+
+    # --- Clustermap ---
+    try:
+        df_sim = pd.DataFrame(cosine_similarity(x), index=labels, columns=labels)
+
+        # --- Changed cmap to "hot" ---
+        g = sns.clustermap(df_sim,
+                           cmap="viridis",  # <--- CHANGE THIS BACK from "hot"
+                           row_linkage=z, col_linkage=z,
+                           annot=True, fmt=".2f", annot_kws={"size": 8})
+        # You can experiment with other cmaps here too
+
+        # Use suptitle to fix title overlap
+        g.figure.suptitle(f"Similarity Clustermap ({title_tag.replace('_', ' ').title()})", y=1.03)
+        plt.setp(g.ax_heatmap.get_xticklabels(), rotation=90)
+        plt.setp(g.ax_heatmap.get_yticklabels(), rotation=0)
+        g.figure.savefig(out_dir / f"paper2_clustermap_{title_tag}.png", metadata={"Date": None}, bbox_inches='tight')
+        plt.close(g.figure)
+    # Added LinAlgError for robustness, as seen in previous dendrogram fix
+    except (ValueError, RuntimeError, IndexError, np.linalg.LinAlgError) as e:
+        logger.warning(f"Skipping clustermap for '{title_tag}' due to error: {e}")
+
+    # --- Dendrogram (Standalone) ---
+    plt.figure(figsize=(max(8, int(len(labels) * 0.5)), 6))
+    ax = plt.gca()
+
+    plotting_cfg = cfg.get("plotting", {})
+    palette_cfg = plotting_cfg.get("palette", {})
+    color0 = palette_cfg.get("cluster0", "#f59d05")
+    color1 = palette_cfg.get("cluster1", "#529a54")
+    color_unassigned = palette_cfg.get("unassigned", "#808080")
+    label_palette = {0: color0, 1: color1, -1: color_unassigned}
+
+    # Plot standalone dendrogram with specific color threshold
+    ddata = dendrogram(z, labels=labels, leaf_rotation=90, ax=ax,
+                       color_threshold=dendrogram_color_threshold,
+                       above_threshold_color='#1b5b8c')
+
+    # Apply K-Means cluster colors to labels
+    xtick_labels = ax.get_xticklabels()
+    if len(xtick_labels) == len(ddata['ivl']):
+        for i, label in enumerate(xtick_labels):
+            label_text = ddata['ivl'][i]
+            if label_text in clusters:
+                label.set_color(label_palette.get(clusters[label_text], color_unassigned))
+    else:
+        logger.warning(f"Label count mismatch in dendrogram for '{title_tag}', cannot color labels.")
+
+    # Add optional cut line
+    dendro_cut = bool(analysis_cfg.get("dendro_cut", False))
+    dendro_h = float(analysis_cfg.get("dendro_cut_height", 0.5))
+    if dendro_cut:
+        plt.axhline(y=dendro_h, color='grey', linestyle="--", linewidth=0.8)
+
+    plt.title(f"Hierarchical Clustering Dendrogram ({title_tag.replace('_', ' ').title()})")
+    plt.ylabel("Cosine Distance")
+
+    # --- Legend ---
+    unique_branch_colors = sorted(list(set(ddata['color_list'])))
+    legend_handles = []
+
+    # Legend for K-Means cluster assignment (label colors)
+    present_kmeans_clusters = sorted([c for c in set(clusters.values())])
+    if present_kmeans_clusters:
+        legend_handles.append(plt.Line2D([0], [0], color='none', label='--- K-Means Clusters (Labels) ---',
+                                         marker='None', linestyle='None'))
+        for cid in present_kmeans_clusters:
+            if cid == 0:
+                legend_name = "Cluster 0 (conceptual)"
+            elif cid == 1:
+                legend_name = "Cluster 1 (physical)"
+            elif cid == -1:
+                legend_name = "Unassigned"
+            else:
+                legend_name = f"Cluster {cid}"
+
+            legend_handles.append(
+                plt.Line2D([0], [0], marker='o', color='w',
+                           label=legend_name,
+                           markerfacecolor=label_palette.get(cid, color_unassigned),
+                           markersize=10, linestyle='None')
+            )
+
+    # Legend for Dendrogram Branch Colors (line colors)
+    if unique_branch_colors:
+        legend_handles.append(plt.Line2D([0], [0], color='none', label='', marker='None', linestyle='None'))
+        legend_handles.append(plt.Line2D([0], [0], color='none', label='--- Dendrogram Branches ---',
+                                         marker='None', linestyle='None'))
+
+        for i, branch_color in enumerate(unique_branch_colors):
+            legend_handles.append(
+                plt.Line2D([0], [0], marker='_', color=branch_color,
+                           label=f"Branch {i + 1}",
+                           markersize=15, linestyle='-', linewidth=2)
+            )
+
+    if legend_handles:
+        plt.legend(handles=legend_handles, title="Legend", bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.)
+
+    plt.tight_layout(rect=(0, 0, 0.85, 1))  # Adjust layout for legend
+    plt.savefig(out_dir / f"paper2_dendrogram_{title_tag}.png", metadata={"Date": None})
+    plt.close()
+
+
+def _plot_bootstrap_hist(scores: List[float], observed: float, ci_lo: float, ci_hi: float, title: str, out_path: Path) -> None:
+    """Histogram of bootstrap ARIs with observed and CI markers."""
+    if not scores or math.isnan(observed):
+        return
+    arr = np.array(scores, dtype=np.float32)
+    plt.figure(figsize=(12, 6))
+    plt.hist(arr, bins=25, edgecolor="black", alpha=0.6)
+    plt.axvline(observed, color="red", linestyle="--", linewidth=2)
+    plt.axvline(ci_lo, color="green", linestyle=":", linewidth=2)
+    plt.axvline(ci_hi, color="green", linestyle=":", linewidth=2)
+    plt.title(title)
+    plt.xlabel("Adjusted Rand Index (ARI)")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+    plt.savefig(out_path, metadata={"Date": None})
+    plt.close()
+
+def _plot_alignment_bar(
+    mode: str,
+    grouping: Dict[str, int],
+    named_clusterings: List[Tuple[str, Dict[str, int]]],
+    out_path: Path,
+    group0_name: str = "conceptual",
+    group1_name: str = "physical",
+) -> None:
+    """Bar chart: ARI per model for a given binary grouping, plus legend with membership."""
+    if not named_clusterings or not grouping:
+        return
+
+    names, vals = [], []
+    for name, clus in named_clusterings:
+        inter = [w for w in grouping.keys() if w in clus]
+        if len(inter) < 3:
+            continue
+        y_true = [grouping[w] for w in inter]
+        y_pred = [clus[w] for w in inter]
+        names.append(name)
+        vals.append(float(_ari(y_true, y_pred)))
+    if not vals:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    xs = np.arange(len(vals))
+    ax.bar(xs, vals)
+    for x, v in zip(xs, vals):
+        ax.text(x, v + 0.01 if v >= 0 else v - 0.05,
+                f"{v:.3f}", ha="center",
+                va="bottom" if v >= 0 else "top")
+
+    ax.set_xticks(xs, names, rotation=25, ha="right")
+    ax.set_ylim(min(-0.1, min(vals) - 0.05), 1.02)
+    ax.set_title(f"Model Alignment with Top Grouping ({mode})")
+    ax.set_ylabel("Adjusted Rand Index (ARI)")
+
+    g0 = sorted([w for w, lab in grouping.items() if lab == 0])
+    g1 = sorted([w for w, lab in grouping.items() if lab == 1])
+
+    def _wrap_terms(items: List[str], width: int = 45) -> str:
+        return textwrap.fill(", ".join(items), width=width)
+
+    legend_text = (
+        f"0 = {group0_name} (n={len(g0)})\n{_wrap_terms(g0)}\n\n"
+        f"1 = {group1_name} (n={len(g1)})\n{_wrap_terms(g1)}"
+    )
+
+    ax.text(
+        1.02, 0.5, legend_text,
+        transform=ax.transAxes, va="center", ha="left",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="lightgray", alpha=0.95),
+    )
+
+    plt.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight", metadata={"Date": None})
+    plt.close(fig)
+
+
+def bootstrap_ari_samples(grouping: Dict[str, int], clusterings: List[Dict[str, int]], words: List[str],
+                          b: int = 200, rng: Optional[random.Random] = None) -> List[float]:
+    """Return bootstrap sample of mean ARIs only, for plotting."""
+    if rng is None:
+        rng = random.Random(ari_seed)
+    common = [w for w in words if any(w in c for c in clusterings)]
+    if len(common) < 3:
+        return []
+    scores: List[float] = []
+    for _ in range(b):
+        sample = [common[rng.randrange(len(common))] for _ in range(len(common))]
+        per_clus = []
+        for clus in clusterings:
+            inter = [w for w in sample if w in clus]
+            if len(inter) < 3:
+                continue
+            y_true = [grouping[w] for w in inter]
+            y_pred = [clus[w] for w in inter]
+            per_clus.append(_ari(y_true, y_pred))
+        if per_clus:
+            scores.append(float(np.mean(per_clus)))
+    return scores
+
+
+# =========================
+# Exemplars (regex-based to avoid substring noise)
+# =========================
+def write_cluster_exemplars(clusters: Dict[str, int], corpus_path: Path, out_path: Path, top_k_per_term: int = 3) -> None:
+    """
+    Qualitative exemplars: dump up to K sentences per term grouped by discovered clusters.
+    One-sentence-per-line corpus assumed. Uses the same word-boundary regex used for embeddings.
+    """
+    if top_k_per_term <= 0 or not clusters:
+        return
+    if not corpus_path.exists():
+        return
+
+    term_to_lines: Dict[str, List[str]] = defaultdict(list)
+    pats = {t: _boundary_regex(t) for t in clusters.keys()}
+
+    with io.open(corpus_path, encoding="utf-8") as f:
+        for line in _pbar(f, desc="exemplars scan"):
+            s = line.strip()
+            if not s:
+                continue
+            for t, pat in pats.items():
+                if len(term_to_lines[t]) >= top_k_per_term:
+                    continue
+                if pat.search(s):
+                    term_to_lines[t].append(s)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with io.open(out_path, "w", encoding="utf-8") as w:
+        for cid in sorted(set(clusters.values())):
+            w.write(f"\n=== Cluster {cid} ===\n")
+            for t, c in sorted(clusters.items(), key=lambda kv: (kv[1], kv[0])):
+                if c != cid:
+                    continue
+                lines = term_to_lines.get(t, [])
+                w.write(f"\n[{t}] ({len(lines)} exemplars)\n")
+                for s in lines:
+                    w.write(f"  - {s}\n")
+
+
+# =========================
+# Core run helpers
+# =========================
+def build_embeddings_for_mode(mode: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, int], Dict[str, int], Path]:
+    """Load models for a mode, compute embeddings and clusters; return (w2v_emb, bert_emb, w2v_clusters, bert_clusters, corpus_path)."""
+    corpus = corpus_file_bert_full if mode == "FULL" else corpus_file_bert_clean
+    logger.info(
+        f"[{mode}] full={corpus_file_bert_full} sha256={sha256_file_p1(corpus_file_bert_full) if corpus_file_bert_full.exists() else 'MISSING'}")
+    logger.info(
+        f"[{mode}] clean={corpus_file_bert_clean} sha256={sha256_file_p1(corpus_file_bert_clean) if corpus_file_bert_clean.exists() else 'MISSING'}")
+
+    cbow, sg = load_w2v_cached(mode)
+    tok, bert_ft, ckpt = load_bert_finetuned_cached(mode, allow_degrade=degrade_on_missing)
+    if ckpt and Path(ckpt).exists():
+        # IMPORTANT FIX: correct hashing depending on whether ckpt is a directory or file
+        logger.info(f"[{mode}] BERT cache hash: {_hash_for_checkpoint(Path(ckpt))}")
+
+    verify_caches_if_requested(mode)
+
+    w2v_src = cbow if cbow is not None else sg
+    w2v_emb = w2v_vecs_for_terms(words_to_explore, w2v_src) if w2v_src is not None else {}
+    bert_emb = bert_vecs_for_terms(words_to_explore, tok, bert_ft, corpus) if bert_ft is not None else {}
+
+    t0 = time.perf_counter()
+    w2v_clusters = kmeans_clusters(w2v_emb, k_clusters, use_l2=True) if w2v_emb else {}
+    bert_clusters = kmeans_clusters(bert_emb, k_clusters, use_l2=True) if bert_emb else {}
+    logger.info(f"[{mode}] clustering in {time.perf_counter()-t0:.2f}s (W2V_terms={len(w2v_emb)}, BERT_terms={len(bert_emb)})")
+
+    _dump_clusters(f"{mode.lower()}_w2v", w2v_clusters)
+    _dump_clusters(f"{mode.lower()}_bert", bert_clusters)
+
+    if w2v_clusters:
+        confirmatory_ari_parity(mode, "W2V", w2v_clusters)
+    if bert_clusters:
+        confirmatory_ari_parity(mode, "BERT_FT", bert_clusters)
+
+    return w2v_emb, bert_emb, w2v_clusters, bert_clusters, corpus
+
+
+# =========================
+# Core run (single seed for *general* visuals)
+# =========================
+def run_general_visuals() -> None:
+    """Run similarity webs, t-SNE, hierarchical plots for both modes with default seed. Independent from ARI scope."""
+    banner("GENERAL VISUALS")
+
+    # Determine group names if confirmatory mode is set globally (or pass None)
+    confirm = _load_confirmatory_grouping_from_cfg(cfg)
+    g0_name, g1_name = (confirm[1], confirm[2]) if confirm else (None, None)
+
+    for mode in ("FULL", "CLEAN"):
+        banner(f"VISUALS MODE = {mode}")
+        w2v_emb, bert_emb, w2v_clusters, bert_clusters, _corpus = build_embeddings_for_mode(mode)
+        if w2v_emb:
+            name = "W2V"
+            # Pass w2v_clusters and group names
+            plot_similarity_web(w2v_emb, w2v_clusters, f"Similarity web ({name}, {mode})", fig_dir / f"paper2_similarity_web_{mode.lower()}_w2v.png",
+                                group0_name=g0_name, group1_name=g1_name) # <-- MODIFIED
+            # Pass w2v_clusters and group names
+            plot_tsne_map(w2v_emb, w2v_clusters, f"t-SNE ({name}, {mode})", fig_dir / f"paper2_tsne_w2v_{mode.lower()}.png", group0_name=g0_name, group1_name=g1_name)
+            # Pass w2v_clusters
+            plot_hierarchical(w2v_emb, w2v_clusters, f"w2v_{mode.lower()}", fig_dir)
+        if bert_emb:
+            name_bert = "BERT FT"
+            # Pass bert_clusters and group names
+            plot_similarity_web(bert_emb, bert_clusters, f"Similarity web ({name_bert}, {mode})", fig_dir / f"paper2_similarity_web_bert_{mode.lower()}.png",
+                                group0_name=g0_name, group1_name=g1_name) # <-- MODIFIED
+            # Pass bert_clusters and group names
+            plot_tsne_map(bert_emb, bert_clusters, f"t-SNE ({name_bert}, {mode})", fig_dir / f"paper2_tsne_bert_{mode.lower()}.png", group0_name=g0_name, group1_name=g1_name)
+            # Pass bert_clusters
+            plot_hierarchical(bert_emb, bert_clusters, f"bert_{mode.lower()}", fig_dir)
+
+def _get_ari_seeds(scope: dict) -> List[int]:
+    """Return explicit seeds if provided; else draw n_runs seeds from base seed."""
+    seeds_cfg = list(scope.get("seeds", []))
+    if seeds_cfg:
+        return [int(s) for s in seeds_cfg]
+    n_runs = int(scope.get("n_runs", 1))
+    base = int(scope.get("seed", 42))
+    rng = random.Random(base)
+    out, seen = [], set()
+    while len(out) < max(1, n_runs):
+        s = rng.randrange(1, 10**9)
+        if s not in seen:
+            out.append(s); seen.add(s)
+    return out
+
+
+def _load_confirmatory_grouping_from_cfg(conf_map: dict) -> Optional[Tuple[Dict[str, int], str, str]]:
+    """
+    Reads ari_runtime.confirmatory in either style:
+      groups: {<name0>: [..], <name1>: [..]}  OR  grouping: {term: 0/1, ...}
+    Returns (map, name_for_0, name_for_1) or None if disabled/missing.
+    """
+    sect = (conf_map.get("ari_runtime") or {}).get("confirmatory", {})
+    if not sect or not bool(sect.get("enabled", False)):
+        return None
+
+    g0_name = sect.get("group_names", {}).get(0, "conceptual")
+    g1_name = sect.get("group_names", {}).get(1, "physical")
+
+    if "grouping" in sect:
+        raw = sect["grouping"].items()
+        g = {str(k): int(v) for k, v in raw if v is not None}
+        return g, g0_name, g1_name
+
+    groups = sect.get("groups")
+    if isinstance(groups, dict) and len(groups) == 2:
+        keys = list(groups.keys())
+        if "group_names" not in sect:
+            g0_name, g1_name = keys[0], keys[1]
+        g0 = {str(w) for w in (groups[keys[0]] or [])}
+        g1 = {str(w) for w in (groups[keys[1]] or [])}
+        g = {w: 0 for w in g0}
+        g.update({w: 1 for w in g1})
+        return g, g0_name, g1_name
+
+    return None
+
+
+def _try_plot_confirmatory(mode: str,
+                           named_clusterings: List[Tuple[str, Dict[str, int]]]) -> None:
+    sect = cfg.get("ari_runtime", {}).get("confirmatory", {})
+    if not sect or not bool(sect.get("enabled", False)):
+        return
+
+    g0_name = sect.get("group_names", {}).get(0, "conceptual")
+    g1_name = sect.get("group_names", {}).get(1, "physical")
+
+    if "grouping" in sect:
+        grouping_map = {str(k): int(v) for k, v in sect["grouping"].items()}
+    else:
+        groups = sect.get("groups", {})
+        if not isinstance(groups, dict) or len(groups) != 2:
+            return
+        keys = list(groups.keys())
+        if "group_names" not in sect:
+            g0_name, g1_name = keys[0], keys[1]
+        g0 = set(map(str, groups[keys[0]] or []))
+        g1 = set(map(str, groups[keys[1]] or []))
+        grouping_map = {w: 0 for w in g0}
+        grouping_map.update({w: 1 for w in g1})
+
+    _plot_alignment_bar(
+        mode=mode,
+        grouping=grouping_map,
+        named_clusterings=named_clusterings,
+        out_path=fig_dir / f"ari_confirmatory_physical_vs_conceptual_{mode.lower()}.png",
+        group0_name=g0_name,
+        group1_name=g1_name,
+    )
+
+
+# =========================
+# ARI runtime (scoped to selected models/corpora/seeds)
+# =========================
+def _cluster_sig(clus: Dict[str, int]) -> str:
+    """
+    Short fingerprint for a {term: cluster} map so we can quickly see if FULL and CLEAN
+    produced effectively the same clustering. Stable across runs with same assignment.
+    """
+    items = ",".join(f"{w}:{c}" for w, c in sorted(clus.items()))
+    return hashlib.sha1(items.encode("utf-8")).hexdigest()[:10]
+
+def run_ari_runtime(run_seed: int) -> None:
+    """
+    Run ARI exploration for selected models/corpora.
+
+    Exploratory mode:
+      - Save top 5000 by ARI (CSV).
+      - Save top 30 by ARI (CSV) and run bootstrap, permutation, and plots for these 30.
+      - Save 100 closest to ARI=0 (CSV).
+      - Save lowest 30 ARI (CSV).
+      - Save high-ARI JSON over top-5000.
+      - Alignment bar plots + per-grouping membership CSVs for top 30.
+
+    Confirmatory mode:
+      - Evaluate exactly the provided grouping with bootstrap, permutation, and a single plot.
+    """
+    banner("ARI RUNTIME")
+    global seed
+    old_seed = seed
+    try:
+        set_all_seeds(run_seed)
+        seed = run_seed
+
+        # lowercase scoped constants
+        top_list_n = 5000
+        top_stats_n = 30
+        closest_zero_n = 100
+        lowest_n = 30
+
+        modes: List[str] = []
+        if "FULL" in ari_corpora:
+            modes.append("FULL")
+        if "CLEAN" in ari_corpora:
+            modes.append("CLEAN")
+
+        # confirmatory config (names carried for legends)
+        confirm_info = _load_confirmatory_grouping_from_cfg(cfg)
+        if confirm_info is not None:
+            confirm_group_map_default, name_g0_default, name_g1_default = confirm_info
+        else:
+            confirm_group_map_default, name_g0_default, name_g1_default = None, "conceptual", "physical"
+
+        summary_rows: List[Dict[str, object]] = []
+
+        for mode in modes:
+            banner(f"ARI MODE = {mode} (seed={run_seed})")
+            w2v_emb, bert_emb, w2v_clusters, bert_clusters, corpus = build_embeddings_for_mode(mode)
+
+            # Which clusterings to compare against
+            clusterings: List[Dict[str, int]] = []
+            if "W2V" in ari_models and w2v_clusters:
+                clusterings.append(w2v_clusters)
+            if "BERT" in ari_models and bert_clusters:
+                clusterings.append(bert_clusters)
+
+            # Signatures for diagnostics
+            w2v_sig = _cluster_sig(w2v_clusters) if w2v_clusters else ""
+            bert_sig = _cluster_sig(bert_clusters) if bert_clusters else ""
+            if w2v_clusters:
+                logger.info(f"[{mode}] W2V signature={w2v_sig} (n={len(w2v_clusters)})")
+            if bert_clusters:
+                logger.info(f"[{mode}] BERT_FT signature={bert_sig} (n={len(bert_clusters)})")
+
+            if not clusterings:
+                logger.warning(f"No clusterings available for ARI in mode {mode} with models {sorted(ari_models)}; skipping.")
+                continue
+
+            # Strict intersection vocabulary across selected models
+            if len(clusterings) == 1:
+                words = [w for w in words_to_explore if w in clusterings[0]]
+            else:
+                common_sets = [set(c.keys()) for c in clusterings]
+                words = sorted(set(words_to_explore).intersection(*common_sets))
+
+            if len(words) < 3:
+                logger.warning(f"Not enough overlapping words for ARI in mode {mode}; skipping.")
+                continue
+
+            sizes = ", ".join(str(len(c)) for c in clusterings)
+            logger.info(f"[{mode}] ARI common vocabulary size = {len(words)} (per-clustering sizes = {sizes})")
+            logger.debug(f"[{mode}] ARI terms: {', '.join(words)}")
+
+            # ---------- Confirmatory path ----------
+            if confirm_group_map_default is not None:
+                # Narrow Optional to the concrete type for the type checker
+                full_map = cast(Dict[str, int], confirm_group_map_default)
+                # --- FIX: REMOVED the redundant assignment below ---
+                # name_g0, name_g1 = name_g0_default, name_g1_default  # This line is deleted
+
+                # Filter mapping to the intersection with available clusterings
+                inter = [w for w in full_map.keys() if any(w in c for c in clusterings)]
+                labels_present = {full_map[w] for w in inter}
+                if len(inter) < 3 or len(labels_present & {0, 1}) < 2:
+                    logger.warning(f"[{mode}] Confirmatory grouping invalid/too small after intersection; skipping.")
+                    continue
+
+                # Now 'full_map' is guaranteed non-None here
+                best_map: Dict[str, int] = {w: full_map[w] for w in inter}
+
+                def _mean_ari(map_: Dict[str, int]) -> float:
+                    vals: List[float] = []
+                    for clus in clusterings:
+                        inter2 = [w for w in inter if w in clus]
+                        if len(inter2) < 3:
+                            continue
+                        y_true = [map_[w] for w in inter2]
+                        y_pred = [clus[w] for w in inter2]
+                        vals.append(_ari(y_true, y_pred))
+                    return float(np.mean(vals)) if vals else float("nan")
+
+                best_ari = _mean_ari(best_map)
+                logger.info(f"[{mode}] Confirmatory: mean ARI = {best_ari:.4f} on {len(best_map)} terms.")
+                all_groupings: List[Tuple[float, Dict[str, int]]] = [(best_ari, best_map)]
+                top_list = all_groupings  # single item
+
+                # ------- Outputs (confirmatory) -------
+                def _split_groups_map(group_map: Dict[str, int]) -> Tuple[str, str]:
+                    g0 = [w for w, lab in group_map.items() if lab == 0]
+                    g1 = [w for w, lab in group_map.items() if lab == 1]
+                    return ", ".join(sorted(g0)), ", ".join(sorted(g1))
+
+                models_str = "_".join(sorted(ari_models)).lower()
+                mode_l = mode.lower()
+
+                top_df = pd.DataFrame(
+                    [{"ARI": best_ari, "Group0": _split_groups_map(best_map)[0], "Group1": _split_groups_map(best_map)[1]}]
+                )
+                top_df.to_csv(res_dir / f"paper2_top_1_ari_{mode_l}_{models_str}.csv", index=False)
+
+                # Bootstrap / permutation for confirmatory
+                do_boot = bool(boot_cfg.get("enabled", True))
+                do_perm = bool(perm_cfg.get("enabled", True))
+                b = min(int(boot_cfg.get("B", 2000)), boot_cap)
+                ci = float(boot_cfg.get("ci", 0.95))
+                r = min(int(perm_cfg.get("R", 5000)), perm_cap)
+                rng = random.Random(run_seed)
+
+                robust_rows: List[Dict[str, object]] = []
+                b_mean, b_std, ci_lo, ci_hi = (float("nan"),) * 4
+                p_val = float("nan")
+                boot_scores_list: List[float] = []
+
+                if do_boot:
+                    words_for_resample = list(best_map.keys())
+                    b_mean, b_std, ci_lo, ci_hi = bootstrap_ari(best_map, clusterings, words_for_resample, b=b, ci=ci, rng=rng)
+                    boot_scores_list = bootstrap_ari_samples(best_map, clusterings, words_for_resample, b=b, rng=rng)
+
+                if do_perm:
+                    words_for_perm = list(best_map.keys())
+                    p_val = permutation_p_value(best_map, clusterings, words_for_perm, r=r, rng=rng)
+
+                robust_rows.append({
+                    "Rank": "Confirmatory",
+                    "ARI_obs": best_ari,
+                    "Boot_mean": b_mean,
+                    "Boot_std": b_std,
+                    "CI_low": ci_lo,
+                    "CI_high": ci_hi,
+                    "P_value": p_val,
+                    "Group0": _split_groups_map(best_map)[0],
+                    "Group1": _split_groups_map(best_map)[1],
+                })
+
+                pd.DataFrame(robust_rows).to_csv(
+                    res_dir / f"paper2_top_1_ari_{mode_l}_{models_str}_robust.csv", index=False
+                )
+
+                if do_boot and boot_scores_list:
+                    _plot_bootstrap_hist(
+                        scores=boot_scores_list,
+                        observed=best_ari,
+                        ci_lo=ci_lo,
+                        ci_hi=ci_hi,
+                        title=f"Bootstrap ARI (Confirmatory, {mode})",
+                        out_path=fig_dir / f"paper2_bootstrap_{mode_l}_{models_str}_confirmatory.png"
+                    )
+
+                # Alignment bar plot (single)
+                named_clusterings: List[Tuple[str, Dict[str, int]]] = []
+                if "W2V" in ari_models and w2v_clusters:
+                    named_clusterings.append(("W2V", w2v_clusters))
+                if "BERT" in ari_models and bert_clusters:
+                    named_clusterings.append(("BERT_FT", bert_clusters))
+                _try_plot_confirmatory(mode, named_clusterings)
+
+            # ---------- Exploratory path ----------
+            else:
+                union_emb: Dict[str, np.ndarray] = {**w2v_emb, **bert_emb}
+                t_ari = time.perf_counter()
+                if len(words) <= ari_max_exhaustive:
+                    logger.info(f"[{mode}] ARI exhaustive over {len(words)} words")
+                    all_groupings = enumerate_all_binary(words, clusterings)
+                else:
+                    logger.info(f"[{mode}] ARI heuristic: max_samples={max_samples}, words={len(words)}")
+                    all_groupings = heuristic_search_binary(
+                        words, union_emb, clusterings, max_samples_limit=max_samples, seed_for_rng=run_seed
+                    )
+                logger.info(f"[{mode}] ARI search finished in {time.perf_counter() - t_ari:.2f}s (candidates={len(all_groupings)})")
+                if not all_groupings:
+                    logger.warning(f"No valid ARI groupings computed for {mode}.")
+                    continue
+
+                # ------- Outputs, lists and stats scopes -------
+                def _split_groups_map(group_map: Dict[str, int]) -> Tuple[str, str]:
+                    g0 = [w for w, lab in group_map.items() if lab == 0]
+                    g1 = [w for w, lab in group_map.items() if lab == 1]
+                    return ", ".join(sorted(g0)), ", ".join(sorted(g1))
+
+                def _list_to_df(lst: List[Tuple[float, Dict[str, int]]]) -> pd.DataFrame:
+                    return pd.DataFrame(
+                        [{"ARI": a, "Group0": _split_groups_map(m)[0], "Group1": _split_groups_map(m)[1]} for a, m in lst]
+                    )
+
+                models_str = "_".join(sorted(ari_models)).lower()
+                mode_l = mode.lower()
+
+                # Longlist: top 5000 by ARI (desc)
+                top_5000 = all_groupings[:top_list_n]
+                _list_to_df(top_5000).to_csv(
+                    res_dir / f"paper2_top_{top_list_n}_ari_{mode_l}_{models_str}.csv", index=False
+                )
+
+                # Stats scope: top 30 by ARI (desc)
+                top_stats = all_groupings[:top_stats_n]
+                _list_to_df(top_stats).to_csv(
+                    res_dir / f"paper2_top_{top_stats_n}_ari_{mode_l}_{models_str}.csv", index=False
+                )
+
+                # Closest to zero: 100 with |ARI| minimal
+                closest_zero = sorted(all_groupings, key=lambda t: abs(t[0]))[:closest_zero_n]
+                _list_to_df(closest_zero).to_csv(
+                    res_dir / f"paper2_closest_zero_top_{closest_zero_n}_ari_{mode_l}_{models_str}.csv", index=False
+                )
+
+                # Lowest 30 ARI
+                lowest_30 = sorted(all_groupings, key=lambda t: t[0])[:lowest_n]
+                _list_to_df(lowest_30).to_csv(
+                    res_dir / f"paper2_lowest_{lowest_n}_ari_{mode_l}_{models_str}.csv", index=False
+                )
+
+                # High-ARI JSON over the longlist
+                high = [{"ari": a, "group0": _split_groups_map(m)[0], "group1": _split_groups_map(m)[1]}
+                        for a, m in top_5000 if a >= ari_min_accept]
+                with io.open(res_dir / f"paper2_high_ari_{mode_l}_{models_str}.json", "w", encoding="utf-8") as jf:
+                    json.dump(high, jf, ensure_ascii=False, indent=2)
+
+                # ------- Robust stats for top_stats only -------
+                do_boot = bool(boot_cfg.get("enabled", True))
+                do_perm = bool(perm_cfg.get("enabled", True))
+                b = min(int(boot_cfg.get("B", 2000)), boot_cap)
+                ci = float(boot_cfg.get("ci", 0.95))
+                r = min(int(perm_cfg.get("R", 5000)), perm_cap)
+                rng = random.Random(run_seed)
+
+                robust_rows: List[Dict[str, object]] = []
+                for rank, (ari_observed, current_map) in enumerate(top_stats, start=1):
+                    b_mean, b_std, ci_lo, ci_hi = (float("nan"),) * 4
+                    p_val = float("nan")
+                    boot_scores_list: List[float] = []
+
+                    if do_boot:
+                        words_for_resample = list(current_map.keys())
+                        b_mean, b_std, ci_lo, ci_hi = bootstrap_ari(
+                            current_map, clusterings, words_for_resample, b=b, ci=ci, rng=rng
+                        )
+                        boot_scores_list = bootstrap_ari_samples(
+                            current_map, clusterings, words_for_resample, b=b, rng=rng
+                        )
+
+                    if do_perm:
+                        words_for_perm = list(current_map.keys())
+                        p_val = permutation_p_value(current_map, clusterings, words_for_perm, r=r, rng=rng)
+
+                    robust_rows.append({
+                        "Rank": rank, "ARI_obs": ari_observed, "Boot_mean": b_mean, "Boot_std": b_std,
+                        "CI_low": ci_lo, "CI_high": ci_hi, "P_value": p_val,
+                        "Group0": _split_groups_map(current_map)[0], "Group1": _split_groups_map(current_map)[1]
+                    })
+
+                    if do_boot and boot_scores_list:
+                        plot_title = f"Bootstrap ARI (Top {rank}, {mode})"
+                        plot_filename = f"paper2_bootstrap_{mode_l}_{models_str}_top{rank}.png"
+                        _plot_bootstrap_hist(
+                            scores=boot_scores_list,
+                            observed=ari_observed,
+                            ci_lo=ci_lo,
+                            ci_hi=ci_hi,
+                            title=plot_title,
+                            out_path=fig_dir / plot_filename
+                        )
+
+                robust_df = pd.DataFrame(robust_rows)
+                robust_df.to_csv(
+                    res_dir / f"paper2_top_{top_stats_n}_ari_{mode_l}_{models_str}_robust.csv", index=False
+                )
+
+                # ------- Alignment bar plots for top 30 -------
+                named_clusterings: List[Tuple[str, Dict[str, int]]] = []
+                if "W2V" in ari_models and w2v_clusters:
+                    named_clusterings.append(("W2V", w2v_clusters))
+                if "BERT" in ari_models and bert_clusters:
+                    named_clusterings.append(("BERT_FT", bert_clusters))
+
+                legend0, legend1 = name_g0_default, name_g1_default
+                for idx, (ari_plot, map_plot) in enumerate(top_stats, start=1):
+                    _plot_alignment_bar(
+                        mode=mode,
+                        grouping=map_plot,
+                        named_clusterings=named_clusterings,
+                        out_path=fig_dir / f"paper2_alignment_{mode_l}_{models_str}_top{idx}.png",
+                        group0_name=legend0,
+                        group1_name=legend1,
+                    )
+                    pd.DataFrame(
+                        [{"term": w,
+                          "cluster_id": int(c),
+                          "cluster_name": (legend0 if c == 0 else legend1)}
+                         for w, c in sorted(map_plot.items())]
+                    ).to_csv(
+                        res_dir / f"paper2_grouping_{mode_l}_{models_str}_top{idx}.csv",
+                        index=False,
+                    )
+
+                # Keep `top_list` for exemplar/summary compatibility
+                top_list = top_5000
+
+            # Exemplars (respects top_exemplars_groupings)
+            for i in range(min(top_exemplar_groupings, len(top_list))):
+                t_ex = time.perf_counter()
+                g_map = top_list[i][1]
+                logger.info(f"[{mode}] Writing exemplars for top grouping {i+1}")
+                write_cluster_exemplars(
+                    g_map,
+                    corpus,
+                    res_dir / f"paper2_cluster_exemplars_{mode.lower()}_ari_top{i+1}.txt",
+                    top_k_per_term=exemplars_per_term
+                )
+                logger.info(f"[{mode}] Exemplars {i+1} written in {time.perf_counter() - t_ex:.2f}s")
+
+            summary_rows.append({
+                "Mode": mode,
+                "Models": "+".join(sorted(ari_models)),
+                "TopK": len(top_list),  # 5000 in exploratory, 1 in confirmatory
+                "Words_used": (len(top_list[0][1]) if top_list else 0),
+                "Seed": run_seed,
+                "Best_ARI": float(top_list[0][0]) if top_list else float("nan"),
+                "W2V_Cluster_Sig": w2v_sig,
+                "BERT_Cluster_Sig": bert_sig
+            })
+
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_csv(res_dir / "paper2_exploratory_ari_summary.csv", index=False)
+
+    finally:
+        set_all_seeds(old_seed)
+        seed = old_seed
+
+
+# =========================
+# Multi-seed orchestration for general visuals only
+# =========================
+def run_visuals_multiseed_or_once() -> None:
+    """If config supplies repeats.seeds, run general visuals per seed; else run once. Optionally aggregate."""
+    global fig_dir, res_dir, seed
+
+    seeds = list(cfg.get("repeats", {}).get("seeds", []))
+    if not seeds:
+        run_general_visuals()
+        return
+
+    for s in seeds:
+        banner(f"GENERAL VISUALS REPEAT SEED = {s}")
+        set_all_seeds(int(s))
+        sub_fig = fig_dir / f"run_seed_{s}"; ensure_dir(sub_fig)
+        sub_res = res_dir / f"run_seed_{s}"; ensure_dir(sub_res)
+        old_fig, old_res, old_seed = fig_dir, res_dir, seed
+        fig_dir, res_dir, seed = sub_fig, sub_res, int(s)
+        try:
+            run_general_visuals()
+        finally:
+            fig_dir, res_dir, seed = old_fig, old_res, old_seed
+            set_all_seeds(old_seed)
+
+    if aggregate_seeds:
+        aggregate_visuals_seed_stability()
+
+
+# =========================
+# Seed-stability aggregation for visuals (optional)
+# =========================
+def _parse_centrality_filename(p: Path) -> Optional[Tuple[str, str]]:
+    """
+    Parse filenames like:
+      paper2_similarity_web_bert_clean.csv  -> model=bert, mode=clean
+      paper2_similarity_web_clean_w2v.csv  -> model=w2v,  mode=clean
+    Returns (mode_lower, model_lower) or None if unrecognised.
+    """
+    name = p.name.replace(".csv", "")
+    parts = name.split("_")
+    if len(parts) < 5:
+        return None
+    tail = parts[3:]
+    if "bert" in tail:
+        model = "bert"
+        mode = [t for t in tail if t not in {"bert", "w2v"}][-1]
+        return mode.lower(), model
+    if "w2v" in tail:
+        model = "w2v"
+        mode = [t for t in tail if t not in {"bert", "w2v"}][-1]
+        return mode.lower(), model
+    return None
+
+
+def aggregate_visuals_seed_stability() -> None:
+    """Aggregate centrality CSVs across seeds."""
+    banner("AGGREGATING VISUALS SEED STABILITY")
+    seed_dirs = [d for d in (fig_dir.iterdir() if fig_dir.exists() else []) if d.is_dir() and d.name.startswith("run_seed_")]
+    rows = []
+    for sd in seed_dirs:
+        csvs = list(sd.glob("paper2_similarity_web_*.csv"))
+        for c in csvs:
+            parsed = _parse_centrality_filename(c)
+            if parsed is None:
+                continue
+            mode, model = parsed
+            try:
+                df = pd.read_csv(c)
+            except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError, OSError) as e:
+                logger.warning(f"Skipping unreadable CSV '{c}': {e}")
+                continue
+            if not {"term", "degree", "betweenness"}.issubset(df.columns):
+                continue
+            seed_val = sd.name.split("_")[-1]
+            for r in df.itertuples(index=False):
+                rows.append({
+                    "seed": int(seed_val),
+                    "mode": mode,
+                    "model": model,
+                    "term": str(r.term),
+                    "degree": float(r.degree),
+                    "betweenness": float(r.betweenness),
+                })
+
+    if not rows:
+        logger.warning("No centrality CSVs found to aggregate.")
+        return
+    tall = pd.DataFrame(rows)
+    agg = (tall
+           .groupby(["mode", "model", "term"], as_index=False)
+           .agg(degree_mean=("degree", "mean"),
+                degree_std=("degree", "std"),
+                betweenness_mean=("betweenness", "mean"),
+                betweenness_std=("betweenness", "std"),
+                n_seeds=("seed", "nunique")))
+    agg = agg.sort_values(by=["mode", "model", "degree_mean", "betweenness_mean"],
+                          ascending=[True, True, False, False])
+    agg.to_csv(res_dir / "paper2_visuals_seed_summary.csv", index=False)
+
+
+# =========================
+# Entry
+# =========================
+def enforce_and_selftest_then_run() -> None:
+    """
+    Execute guardrails, then dispatch. When repeats.seeds exist, route ARI outputs
+    and figures into per-seed subfolders: results/run_seed_{ari_seed} and
+    figures/run_seed_{ari_seed}.
+    """
+    global res_dir, fig_dir
+
+    enforce_versions_if_requested()
+    # Catch duplicated caches BEFORE doing anything expensive
+    try:
+        check_model_caches_distinctness()
+    except RuntimeError as e:
+        logger.error(str(e))
+        raise
+    self_test_if_requested()
+
+    if args.mode in ("all", "ari"):
+        seeds_cfg = list(cfg.get("repeats", {}).get("seeds", []))
+        if seeds_cfg:
+            sub_res = res_dir / f"run_seed_{ari_seed}"; ensure_dir(sub_res)
+            sub_fig = fig_dir / f"run_seed_{ari_seed}"; ensure_dir(sub_fig)
+            old_res, old_fig = res_dir, fig_dir
+            res_dir, fig_dir = sub_res, sub_fig
+            try:
+                run_ari_runtime(run_seed=ari_seed)
+            finally:
+                res_dir, fig_dir = old_res, old_fig
+        else:
+            run_ari_runtime(run_seed=ari_seed)
+
+    if args.mode in ("all", "visuals"):
+        run_visuals_multiseed_or_once()
+
+
+if __name__ == "__main__":
+    enforce_and_selftest_then_run()
