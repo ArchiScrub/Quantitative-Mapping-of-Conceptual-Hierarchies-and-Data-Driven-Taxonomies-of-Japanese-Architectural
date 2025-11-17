@@ -47,4 +47,12 @@ Final run report exploratory ARI...: A final text report summarizing the results
 
 paper2_env.json: A JSON file capturing the environment and parameters for a specific run.
 
-Would you like me to help you draft a short "About" description for this GitHub repository as well?
+
+
+### Third-party libraries
+
+The scripts in this repository depend on external libraries
+(e.g. `transformers`, `scikit-learn`, and other Python packages).
+Those libraries are **not** covered by the licences in this
+repository. They keep their own original licences as distributed
+upstream.
